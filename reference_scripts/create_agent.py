@@ -79,3 +79,24 @@ ny_response = agent.invoke(
     {"messages": [{"role": "user", "content": "what about new york?"}]},
     config
 )
+
+
+
+
+
+agent = create_react_agent(
+    model="gemini-2.5-flash",
+    tools=[get_weather],
+)
+
+# stream mode options: 
+stream_mode = ["values", "updates", "custom", "messages", "debug"]
+
+for chunk in agent.stream(
+    input={"messages": [{"role": "user", "content": "what is the weather in sf"}]},
+    stream_mode=stream_mode[3] 
+):
+    print(chunk)
+    print("\n")
+
+

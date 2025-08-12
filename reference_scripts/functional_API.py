@@ -1,5 +1,4 @@
 
-
 """"
 NOTE:
 Functional API vs. Graph API
@@ -15,8 +14,20 @@ The Functional API uses two key building blocks:
 
 @entrypoint -  used to create a workflow from a function. It encapsulates workflow logic and manages execution flow, including handling long-running tasks and interrupts. The function must accept a single POSITIONAL argument (or a dictionary with multiple piece of date) as the workflow input. Using the @entrypoint yields a Pregal object that can be executed using the invoke, ainvoke, stream and astream methods.
 
-@task - Represents a discrete unit of work, such as an API call or data processing step, that can be executed asynchronously within an entrypoint. Tasks return a future-like object that can be awaited or resolved synchronously. To obtain the result of a task, task_name.result() or 
+@task - Represents a discrete unit of work, such as an API call or data processing step, that can be executed asynchronously within an entrypoint. Tasks return a future-like object that can be awaited or resolved synchronously. To obtain the result of a task, call the .result() method, or await keyword in async function. 
 
+NOTE: LangGraph, built on JavaScript/TypeScript, often leverages async/await for managing asynchronous workflows, such as fetching data, processing nodes, or handling I/O operations in a graph-based structure. In a LangGraph async function, the await keyword is used to pause the execution of the function until a Promise (or an asynchronous operation) resolves, allowing the function to handle asynchronous tasks in a synchronous-like manner. 
+
+NOTE: Routine (regular function) vs Coroutine
+Routine: Executes synchronously and sequentially. Once called, it runs to completion before returning control to the caller. It is defined using def. It returns a value directly upon completion.
+Coroutine: Executes asynchronously and cooperatively. It can be suspended at await expressions, allowing other coroutines to run, and then resumed later from the point of suspension. It is defined using async def and typically uses await to pause execution for I/O operation or other asynchronous tasks. When called, it immdeiately returns a coroutine object. The actual resulst of coroutine is obtained by "awaiting" it within another coroutine or by running it using an event loop.
+
+
+NOTE:
+Pregel implements LangGraph's runtime, managing the execution of LangGraph applications. Pregel runtime is named after Google's Pregal algorithm, which is an efficient method for large-scale parallel computation using graphs.
+
+A pregal instance can be created either by compiling a StateGraph or by constructing an entrypoint, and be invoked with input.
+In LangGraph, Pregel combines actors (PregalNode, runnable interface) and channels into a single application. Actors subscribe to channels, read data from channels and write data to channels. 
 
 Key Methods of the Pregel Object
 The Pregel object provides several methods for interacting with the graph:
@@ -27,14 +38,19 @@ The Pregel object provides several methods for interacting with the graph:
 - update_state(values): Updates the graph's state manually.
 - get_graph(): Returns a drawable representation of the computation graph.
 - with_config(config): Creates a copy of the Pregel object with an updated configuration (e.g., setting recursion_limit).
-- get_state_history(config): Retrive intermediate states. e.g. list(graph_name.get_state_history(config))
-- get_state(): Retrieves the current state of the graph.
-
+- get_state(): Retrieves the current thread state (stored by the checkpoint).
+- get_state_history(config): Retrive the history of the thread (checkpoints). e.g. list(graph_name.get_state_history(config))
 
 """
+
+
 import time
-from typing import TypedDict
+from typing import Callable, TypedDict, Union
 import uuid
+
+from langchain_core.messages import BaseMessage, ToolCall, ToolMessage
+from langchain_core.tools import BaseTool, tool as create_tool
+from langchain_core.runnables import RunnableConfig
 
 from langgraph.cache.memory import InMemoryCache
 from langchain.chat_models import init_chat_model
@@ -43,10 +59,12 @@ from langgraph.config import get_stream_writer
 
 from langgraph.func import entrypoint, task
 from langgraph.graph import StateGraph
+from langgraph.graph.message import add_messages
+
+from langgraph.prebuilt.interrupt import HumanInterruptConfig, HumanInterrupt
+from langgraph.prebuilt import create_react_agent
+
 from langgraph.types import Command, interrupt, RetryPolicy, CachePolicy
-
-
-
 
 
 import dotenv
@@ -214,6 +232,7 @@ def step_1(input_query):
 @task
 def human_feedback(input_query):
     """Append user input."""
+    # interrupt() is called inside a task, enabling a human to review and edit the output of the previous task. 
     feedback = interrupt(f"Please provide feedback: {input_query}")
     return f"{input_query} {feedback}"
 
@@ -245,7 +264,7 @@ for event in graph.stream("foo", config):
 #     {'__interrupt__': (Interrupt(value='Please provide feedback: foo bar', id='72068c7561377a42e998a6a0d7c38b37'),)}
 #     ]
 
-# Continue execution
+# Continue execution - we issue a Command containing the data expected by the human_feedback task
 for event in graph.stream(Command(resume="baz"), config):
     print(event)
     print("\n")
@@ -255,3 +274,161 @@ for event in graph.stream(Command(resume="baz"), config):
 #     {'human_feedback': 'foo bar baz'},
 #     {'step_3': 'foo bar baz qux'}, {'graph': 'foo bar baz qux'}
 #     ]
+
+
+# a review_tool_call function that calls interrupt. When this function is called, execution will be paused until we issue a command to resume it.
+
+def add_human_in_the_loop(
+    tool: Callable | BaseTool,
+    *,
+    interrupt_config: HumanInterruptConfig = None,
+) -> BaseTool:
+    """Wrap a tool to support human-in-the-loop review."""
+    if not isinstance(tool, BaseTool):
+        tool = create_tool(tool)
+
+    if interrupt_config is None:
+        interrupt_config = {
+            "allow_accept": True,
+            "allow_edit": True,
+            "allow_respond": True,
+        }
+
+    @create_tool(  
+        tool.name,
+        description=tool.description,
+        args_schema=tool.args_schema
+    )
+    def call_tool_with_interrupt(config: RunnableConfig, **tool_input):
+        request: HumanInterrupt = {
+            "action_request": {
+                "action": tool.name,
+                "args": tool_input
+            },
+            "config": interrupt_config,
+            "description": "Please review the tool call"
+        }
+        response = interrupt([request])[0]  
+        # approve the tool call
+        if response["type"] == "accept":
+            tool_response = tool.invoke(tool_input, config)
+        # update tool call args
+        elif response["type"] == "edit":
+            tool_input = response["args"]["args"]
+            tool_response = tool.invoke(tool_input, config)
+        # respond to the LLM with user feedback
+        elif response["type"] == "response":
+            user_feedback = response["args"]
+            tool_response = user_feedback
+        else:
+            raise ValueError(f"Unsupported interrupt response type: {response['type']}")
+
+        return tool_response
+
+    return call_tool_with_interrupt
+
+checkpointer = InMemorySaver()
+
+def book_hotel(hotel_name: str):
+   """Book a hotel"""
+   return f"Successfully booked a stay at {hotel_name}."
+
+
+agent = create_react_agent(
+    model=llm,
+    tools=[
+        add_human_in_the_loop(book_hotel), 
+    ],
+    checkpointer=checkpointer,
+)
+
+config = {"configurable": {"thread_id": "1"}}
+
+# Run the agent
+for chunk in agent.stream(
+    {"messages": [{"role": "user", "content": "book a stay at McKittrick hotel"}]},
+    config
+):
+    print(chunk)
+    print("\n")
+
+
+
+
+from typing import Optional
+from langgraph.func import entrypoint
+from langgraph.checkpoint.memory import InMemorySaver
+
+checkpointer = InMemorySaver()
+
+@entrypoint(checkpointer=checkpointer)
+def accumulate(n: int, *, previous: Optional[int]) -> entrypoint.final[int, int]:
+    previous = previous or 0
+    total = previous + n
+    # Return the *previous* value to the caller but save the *new* total to the checkpoint.
+    return entrypoint.final(value=previous, save=total)
+
+config = {"configurable": {"thread_id": "my-thread"}}
+
+print(accumulate.invoke(1, config=config))  # 0
+print(accumulate.invoke(2, config=config))  # 1
+print(accumulate.invoke(3, config=config))  # 3
+
+list(accumulate.get_state_history(config))
+
+
+# The InMemorySaver stores checkpoints in an internal dictionary, where the keys are thread_id values. To reveal all checkpointer threads
+for thread_key, state in checkpointer.storage.items():
+    thread_id = thread_key 
+    print(f"Thread ID: {thread_id}\n State: {state}")
+
+# to erase all checkpointer threads
+checkpointer.storage.clear()
+
+# To verify the python top level thread - MainThread
+import threading
+for thread in threading.enumerate():
+    print(f"Thread name: {thread.name}, ID: {thread.ident}, Alive: {thread.is_alive()}")
+# Returns: Thread name: MainThread, ID: 139741804627776, Alive: True
+# The `MainThread`` is the thread that starts automatically when you run a Python program. The MainThread executes the top-level code of your script. It responsible for starting other threads if your program creates them.
+
+
+
+### Example to illustrate coroutine and asynchronous execution
+import asyncio
+
+# Define a coroutine
+async def say_hello():
+    print("Hello")
+    await asyncio.sleep(1)  # Simulate an I/O-bound task (e.g., waiting for data)
+    print("World")
+
+# Define another coroutine
+async def say_goodbye():
+    print("Good")
+    await asyncio.sleep(0.5)  # Simulate a shorter I/O-bound task
+    print("Bye")
+
+# Main coroutine to run multiple coroutines
+async def main():
+    # Run coroutines concurrently
+    await asyncio.gather(say_hello(), say_goodbye())
+
+# Run the event loop
+if __name__ == "__main__":
+    asyncio.run(main())
+
+# Returs:
+#   Hello
+#   Good
+#   Bye
+#   World
+"""
+NOTE: Key Points
+Use async def to define a coroutine and await to pause it for asynchronous tasks.
+Use asyncio.run() to execute the main coroutine in an event loop.
+Use asyncio.gather() to run multiple coroutines concurrently.
+Coroutines are best for I/O-bound tasks, not CPU-bound tasks (use multiprocessing or concurrent.futures for CPU-intensive work).
+Always run await inside an async def function; you cannot use await in regular functions.
+
+"""
