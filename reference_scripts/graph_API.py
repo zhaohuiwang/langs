@@ -7,6 +7,11 @@ It can be a simple dictionary, a typed dictionary (TypedDict), a Pydantic model,
 The state is updated by nodes, and LangGraph handles the mechanics of passing and updating the state between nodes.
 You can customize the state structure to fit your application's needs, making it as simple or complex as required.
 
+NOTE: A key in LangGraph refers to a unique identifier used to reference specific nodes, edges, or states within a graph structure.
+State Keys: A key is a string or identifier used to store and access specific pieces of data in the state dictionary, or state attributes.
+Node Keys: Each node in a LangGraph workflow is identified by a unique key.
+Edge Keys: 
+
 NOTE: Conditional edges are evaluated at runtime immediately after the source node finishes executing.
 Syntax: add_conditional_edges(source:str, path:Callable[...] | Runnable[...], path_map=dict[Hashable, str] | list[str] | None) -> Self
 The core of evaluation is the `path` callable/runnable. It inspects the state and applied your custom condition(s) for return.
